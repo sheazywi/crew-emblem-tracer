@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fake emblem editor (Crest Forge test harness)</title>
+  </head>
+  <body>
+    <!--
+      A local stand-in for the crew emblem editor, used only by the end-to-end tests.
+
+      It mimics the observed contract in docs/editor-contract.md: a webpackChunksc_web array
+      whose push() hands out a require function with a module cache, a layer manager
+      (add / removeAll / getLayers), a shape-group loader (loadGroups / initObjects), and a
+      shape library, including the whole-pixel rounding and "x + y = 0 is skipped" quirks.
+
+      The library holds the handful of primitive outlines from the contract plus a few made-up
+      stand-in shapes (slugs starting with "cf-"). It contains no artwork from the real editor.
+
+      Query string: ?missing=webpack,layers,groups,shapes removes parts, to test error messages.
+    -->
+    <canvas id="view" width="512" height="512"></canvas>
+    <script>
+      (() => {
+        'use strict';
+        const missing = (new URLSearchParams(location.search).get('missing') || '').split(',');
+
+        // --- audit: count anything a console script must never do ---------------------------
+        const audit = (window.__audit = { net: 0, storage: 0, cookie: 0 });
+        const realFetch = window.fetch;
+        window.fetch = function () {
+          audit.net++;
+          return realFetch.apply(this, arguments);
+        };
+        const realOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function () {
+          audit.net++;
+          return realOpen.apply(this, arguments);
+        };
+        if (navigator.sendBeacon) {
+          Navigator.prototype.sendBeacon = function () {
+            audit.net++;
+            return true;
+          };
+        }
+        window.WebSocket = function () {
+          audit.net++;
+          throw new Error('no sockets in the harness');
+        };
+        for (const key of ['getItem', 'setItem', 'removeItem', 'clear', 'key']) {
+          const real = Storage.prototype[key];
+          Storage.prototype[key] = function () {
+            audit.storage++;
+            return real.apply(this, arguments);
+          };
+        }
+        Object.defineProperty(document, 'cookie', {
+          configurable: true,
+          get() {
+            audit.cookie++;
+            return '';
+          },
+          set() {
+            audit.cookie++;
+          },
+        });
+
+        // --- shape library --------------------------------------------------------------------
+        const circle = (c) => `M${c},0A${c},${c},0,1,1,${c},${2 * c}A${c},${c},0,1,1,${c},0Z`;
+        const ring = (size, ratio) => {
+          const c = size / 2;
+          const r = c * ratio;
+          return circle(c) + `M${c},${c - r}A${r},${r},0,1,0,${c},${c + r}A${r},${r},0,1,0,${c},${c - r}Z`;
+        };
+        let longPath = 'M0,150';
+        for (let i = 1; i <= 420; i++) longPath += `L${((i * 300) / 420).toFixed(2)},${i % 2 ? 20 : 280}`;
+        longPath += 'L300,300L0,300Z';
+
+        const shape = (name, width, height, path, type) => ({
+          name,
+          width,
+          height,
+          path,
+          type: type || 'path',
+        });
+        const GROUPS = {
+          rectangles: [
+            { name: 'square', width: 300, height: 300, type: 'rectangle' },
+            shape('cf-bar', 300, 120, 'M0,0H300V120H0Z'),
+          ],
+          rounds: [
+            shape('01', 300, 300, circle(150)),
+            shape('67', 300, 300, ring(300, 0.9933)),
+            shape('68', 300, 300, ring(300, 0.9667)),
+            shape('69', 300, 300, ring(300, 0.9333)),
+            shape('70', 300, 300, ring(300, 0.8333)),
+            shape('13', 300, 300, ring(300, 0.3183)),
+            shape('14', 288, 288, ring(288, 0.4887)),
+          ],
+          angles: [
+            shape('03', 159, 300, 'M0,300L158.91,300L79.457,0Z'),
+            shape('05', 192, 300, 'M192,300L0,300L192,0Z'),
+            shape('cf-chevron', 300, 200, 'M0,200L150,0L300,200L300,120L150,80L0,120Z'),
+          ],
+          polygons: [
+            shape('04', 300, 260, 'M75,0L225,0L300,129.9L225,259.8L75,259.8L0,129.9Z'),
+            shape('cf-diamond', 200, 300, 'M100,0L200,150L100,300L0,150Z'),
+          ],
+          squares: [
+            shape(
+              'cf-rounded',
+              300,
+              300,
+              'M40,0H260A40,40,0,0,1,300,40V260A40,40,0,0,1,260,300H40A40,40,0,0,1,0,260V40A40,40,0,0,1,40,0Z',
+            ),
+          ],
+          triangles: [shape('cf-eq', 300, 260, 'M150,0L300,260L0,260Z')],
+          curves: [
+            shape('cf-crescent', 300, 300, 'M150,0A150,150,0,1,1,150,300A110,150,0,1,0,150,0Z'),
+            shape(
+              'cf-drop',
+              300,
+              300,
+              'M150,0C230,110,280,170,280,220A130,80,0,0,1,20,220C20,170,70,110,150,0Z',
+            ),
+            shape('cf-wave', 300, 200, 'M0,100C75,0,150,0,225,100C262,150,300,150,300,100V200H0Z'),
+            shape('cf-long', 300, 300, longPath),
+          ],
+          perspective: [shape('cf-trapezoid', 300, 200, 'M60,0L240,0L300,200L0,200Z')],
+          radials: [shape('cf-wedge', 300, 300, 'M0,300L300,300A300,300,0,0,0,0,0Z')],
+          stars: [
+            shape(
+              'cf-star',
+              300,
+              286,
+              'M150,0L185,109L300,109L207,176L243,286L150,218L57,286L93,176L0,109L115,109Z',
+            ),
+          ],
+        };
+
+        const Shapes = {
+          library: {},
+          groups: Object.keys(GROUPS),
+          create(slug, data) {
+            return makeLayer(slug, data || {});
+          },
+        };
+        const addGroup = (name) => {
+          for (const s of GROUPS[name] || []) {
+            Shapes.library[name + '/' + s.name] = Object.assign(
+              { slug: name + '/' + s.name, groups: [name] },
+              s,
+            );
+          }
+        };
+        addGroup('rectangles'); // the internal background square is always there
+
+        const Groups = {
+          loads: [],
+          initObjects() {},
+          // Mimics the JSONP loader: asynchronous, callback when every group has arrived.
+          loadGroups(list, cb) {
+            this.loads.push(list.slice());
+            setTimeout(
+              () => {
+                for (const path of list) addGroup(String(path).replace('emblems/shapes/', ''));
+                if (typeof cb === 'function') cb();
+              },
+              60 + list.length * 5,
+            );
+          },
+        };
+
+        // --- layers ---------------------------------------------------------------------------
+        const LAYERS_MAX = 750;
+        const layers = [];
+        const paths = {};
+        const pathOf = (lib) => {
+          if (!paths[lib.slug])
+            paths[lib.slug] = new Path2D(lib.path || `M0,0H${lib.width}V${lib.height}H0Z`);
+          return paths[lib.slug];
+        };
+        const clampScale = (v) => (Math.abs(v) < 1 ? (v < 0 ? -1 : 1) : v);
+
+        function makeLayer(slug, d) {
+          const lib = Shapes.library[slug];
+          const L = {
+            id: d.id || 's' + Date.now(),
+            name: d.name || lib.name,
+            slug,
+            type: lib.type,
+            x: 0,
+            y: 0,
+            width: lib.width,
+            height: lib.height,
+            scaleX: 100,
+            scaleY: 100,
+            rotation: Number(d.rotation) || 0,
+            _rotation: Number(d.rotation) || 0,
+            opacity: d.opacity === undefined ? 100 : Number(d.opacity),
+            invertedX: false,
+            invertedY: false,
+            color: d.color || '#ffffff',
+            self: { transformString: '' },
+            // The editor stores whole pixels and returns early when (x - 0) + (y - 0) === 0.
+            move(x, y) {
+              if (x - this.x + (y - this.y) === 0) return;
+              this.x = Math.round(x);
+              this.y = Math.round(y);
+            },
+            flipHorizontal(on) {
+              this.invertedX = on;
+              this.scaleX = -this.scaleX;
+            },
+            flipVertical(on) {
+              this.invertedY = on;
+              this.scaleY = -this.scaleY;
+            },
+            draw() {
+              this.self.transformString =
+                `T${this.x},${this.y}R${this.rotation},${this.x + this.width / 2},${this.y + this.height / 2}` +
+                `S${this.scaleX / 100},${this.scaleY / 100}`;
+              scheduleRender();
+            },
+          };
+          // On load only scales below 1% are clamped. A flipped layer stores a negative scale:
+          // the editor negates the stored value, then the flip negates it again.
+          let sx = clampScale(d.scaleX === undefined ? 100 : Number(d.scaleX));
+          let sy = clampScale(d.scaleY === undefined ? 100 : Number(d.scaleY));
+          if (d.invertedX) sx = -sx;
+          if (d.invertedY) sy = -sy;
+          L.scaleX = sx;
+          L.scaleY = sy;
+          if (d.invertedX) L.flipHorizontal(true);
+          if (d.invertedY) L.flipVertical(true);
+          L.move(Number(d.x) || 0, Number(d.y) || 0);
+          return L;
+        }
+
+        const Layers = {
+          // One setTimeout per layer, FIFO order.
+          add(slug, data, useIndex, initial, callback) {
+            setTimeout(() => {
+              if (!Shapes.library[slug] || layers.length >= LAYERS_MAX) return;
+              const L = Shapes.create(slug, data);
+              layers.push(L);
+              L.draw();
+              if (typeof callback === 'function') callback(L);
+            }, 0);
+          },
+          getLayers() {
+            return layers;
+          },
+          // The real editor clicks each layer's unlock and delete buttons; that takes a moment.
+          removeAll() {
+            setTimeout(() => {
+              layers.length = 0;
+              scheduleRender();
+            }, 250);
+          },
+        };
+
+        // --- rendering: the Canvas 2D equivalent of T{x},{y} R{rot},{cx},{cy} S{sx},{sy} -------
+        const view = document.getElementById('view');
+        const ctx = view.getContext('2d');
+        let queued = false;
+        function render() {
+          queued = false;
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.clearRect(0, 0, 512, 512);
+          for (const L of layers) {
+            const lib = Shapes.library[L.slug];
+            ctx.save();
+            ctx.translate(L.x + L.width / 2, L.y + L.height / 2);
+            ctx.rotate((L.rotation * Math.PI) / 180);
+            ctx.scale(L.scaleX / 100, L.scaleY / 100);
+            ctx.translate(-L.width / 2, -L.height / 2);
+            ctx.globalAlpha = L.opacity / 100;
+            ctx.fillStyle = L.color;
+            ctx.fill(pathOf(lib));
+            ctx.restore();
+          }
+        }
+        function scheduleRender() {
+          if (queued) return;
+          queued = true;
+          requestAnimationFrame(render);
+        }
+
+        // --- webpack-style module cache ---------------------------------------------------------
+        const cache = {};
+        let id = 4100;
+        const register = (exports) => {
+          cache[id++] = { exports };
+        };
+        register({ unrelated: true });
+        register(null);
+        cache[id++] = undefined;
+        register(function notAnObject() {});
+        if (!missing.includes('layers')) register(Layers);
+        if (!missing.includes('groups')) register(Groups);
+        if (!missing.includes('shapes')) register(Shapes);
+        const req = (moduleId) => cache[moduleId].exports;
+        req.c = cache;
+        const chunks = [];
+        chunks.push = function (chunk) {
+          if (chunk && typeof chunk[2] === 'function') chunk[2](req);
+          return Array.prototype.push.call(this, chunk);
+        };
+        if (!missing.includes('webpack')) window.webpackChunksc_web = chunks;
+
+        // --- test access ------------------------------------------------------------------------
+        window.__harness = {
+          snapshot: () =>
+            layers.map((L) => ({
+              slug: L.slug,
+              name: L.name,
+              type: L.type,
+              x: L.x,
+              y: L.y,
+              scaleX: L.scaleX,
+              scaleY: L.scaleY,
+              rotation: L.rotation,
+              _rotation: L._rotation,
+              opacity: L.opacity,
+              color: L.color,
+              invertedX: L.invertedX,
+              invertedY: L.invertedY,
+              transform: L.self.transformString,
+            })),
+          png: () => {
+            render();
+            return view.toDataURL('image/png');
+          },
+          groupLoads: () => Groups.loads,
+          librarySize: () => Object.keys(Shapes.library).length,
+        };
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,2 @@
+# A flat node_modules keeps paths short enough for the Windows 260-character limit.
+nodeLinker: hoisted

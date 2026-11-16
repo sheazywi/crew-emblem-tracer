@@ -1,0 +1,10 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`generated console scripts > stay small enough to paste 1`] = `
+{
+  "import740": 61321,
+  "import80": 14461,
+  "importTemplate": 8824,
+  "traceTemplate": 30033,
+}
+`;
